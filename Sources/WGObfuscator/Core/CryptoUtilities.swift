@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Security)
+import Security
+#endif
 
 /// CRC8 and CRC32 implementations for obfuscation
 public struct CryptoUtilities: Sendable {
@@ -138,11 +141,22 @@ public struct CryptoUtilities: Sendable {
 extension Data {
     /// Secure random data generation
     public static func secureRandom(count: Int) -> Data {
+#if canImport(Security)
         var data = Data(count: count)
-        let result = data.withUnsafeMutableBytes { buffer in
-            SecRandomCopyBytes(kSecRandomDefault, count, buffer.baseAddress!)
+        let result = data.withUnsafeMutableBytes { buffer -> OSStatus in
+            guard let baseAddress = buffer.baseAddress else {
+                return errSecParam
+            }
+            return SecRandomCopyBytes(kSecRandomDefault, count, baseAddress)
         }
         precondition(result == errSecSuccess, "Failed to generate random data")
         return data
+#else
+        var generator = SystemRandomNumberGenerator()
+        let bytes = (0..<count).map { _ in
+            UInt8.random(in: UInt8.min...UInt8.max, using: &generator)
+        }
+        return Data(bytes)
+#endif
     }
 }
