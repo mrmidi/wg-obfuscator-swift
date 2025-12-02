@@ -18,8 +18,7 @@ let package = Package(
             name: "WGObfuscator",
             dependencies: [],
             swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency"),
-                .unsafeFlags(["-warnings-as-errors"])
+                .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
         .testTarget(
