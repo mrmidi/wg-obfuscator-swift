@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Logging
 import os.log
 
 /// UDP Proxy that sits between WireGuard (localhost) and the Remote Server.
@@ -26,7 +27,7 @@ public actor UDPProxy {
     // MARK: - Properties
     
     private let config: Configuration
-    private let logger = Logger(subsystem: "com.wg-obfuscator", category: "UDPProxy")
+    private let logger = Logger(label: "com.wg-obfuscator.UDPProxy")
     
     private var listener: NWListener?
     private var remoteConnection: NWConnection?
@@ -202,47 +203,12 @@ public actor UDPProxy {
             guard let self = self else { return }
             
             if let error = error {
-                self.logger.error("Receive local error: \(error.localizedDescription)")
+                Task { await self.logError("Receive local error: \(error.localizedDescription)") }
                 return
             }
             
             if let data = content, !data.isEmpty {
-                Task {
-                    do {
-                        // 1. Encode (Obfuscate)
-                        // Note: We assume 'data' is a standard WireGuard packet.
-                        // We need to determine the type. For simplicity, we might try to guess or track state.
-                        // However, PacketCodec.encode requires a type.
-                        // WireGuard first byte:
-                        // 1 = Handshake Initiation
-                        // 2 = Handshake Response
-                        // 3 = Cookie Reply
-                        // 4 = Transport Data
-                        
-                        guard let typeByte = data.first,
-                              let type = WireGuardMessageType(rawValue: typeByte) else {
-                            self.logger.error("Unknown WireGuard packet type: \(data.first ?? 0)")
-                            return
-                        }
-                        
-                        let obfuscated = try await self.codec.encode(data, type: type)
-                        
-                        // 2. Wrap in STUN (if needed - assuming yes for now based on requirements)
-                        let wrapped = try await self.stunMasker.wrap(obfuscated)
-                        
-                        // 3. Send to Remote
-                        if let remote = self.remoteConnection {
-                            remote.send(content: wrapped, completion: .contentProcessed({ error in
-                                if let error = error {
-                                    self.logger.error("Send remote error: \(error.localizedDescription)")
-                                }
-                            }))
-                        }
-                        
-                    } catch {
-                        self.logger.error("Obfuscation error: \(error.localizedDescription)")
-                    }
-                }
+                Task { await self.processLocalPacket(data) }
             }
             
             // Continue receiving
@@ -252,41 +218,50 @@ public actor UDPProxy {
         }
     }
     
+    private func processLocalPacket(_ data: Data) async {
+        do {
+            // 1. Encode (Obfuscate)
+            guard let typeByte = data.first,
+                  let type = WireGuardMessageType(rawValue: UInt32(typeByte)) else {
+                logger.error("Unknown WireGuard packet type: \(data.first ?? 0)")
+                return
+            }
+            
+            let obfuscated = try await self.codec.encode(data, type: type)
+            
+            // 2. Wrap in STUN (DISABLED - Server expects NONE)
+            // let wrapped = try await self.stunMasker.wrap(obfuscated)
+            let wrapped = obfuscated
+            
+            // 3. Send to Remote
+            if let remote = self.remoteConnection {
+                // logger.debug("Sending \(wrapped.count) bytes to remote (Type: \(type))")
+                os_log("UDPProxy: -> Remote (%d bytes, Type: %d)", type: .debug, wrapped.count, typeByte)
+                
+                remote.send(content: wrapped, completion: .contentProcessed({ [weak self] error in
+                    if let error = error {
+                        Task { await self?.logError("Send remote error: \(error.localizedDescription)") }
+                    }
+                }))
+            }
+            
+        } catch {
+            logger.error("Obfuscation error: \(error.localizedDescription)")
+        }
+    }
+    
     /// Receive obfuscated packets from Remote, De-obfuscate, Send to Local
     private func receiveFromRemote(_ connection: NWConnection) {
         connection.receiveMessage { [weak self] content, context, isComplete, error in
             guard let self = self else { return }
             
             if let error = error {
-                self.logger.error("Receive remote error: \(error.localizedDescription)")
+                Task { await self.logError("Receive remote error: \(error.localizedDescription)") }
                 return
             }
             
             if let data = content, !data.isEmpty {
-                Task {
-                    do {
-                        // 1. Unwrap STUN
-                        guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-                            // Not a data packet (maybe STUN keepalive response?), ignore
-                            return
-                        }
-                        
-                        // 2. Decode (De-obfuscate)
-                        let cleartext = try await self.codec.decode(obfuscated)
-                        
-                        // 3. Send to Local (WireGuard)
-                        if let local = self.localConnection {
-                            local.send(content: cleartext, completion: .contentProcessed({ error in
-                                if let error = error {
-                                    self.logger.error("Send local error: \(error.localizedDescription)")
-                                }
-                            }))
-                        }
-                        
-                    } catch {
-                        self.logger.error("De-obfuscation error: \(error.localizedDescription)")
-                    }
-                }
+                Task { await self.processRemotePacket(data) }
             }
             
             // Continue receiving
@@ -294,6 +269,40 @@ public actor UDPProxy {
                 self.receiveFromRemote(connection)
             }
         }
+    }
+    
+    private func processRemotePacket(_ data: Data) async {
+        do {
+            // 1. Unwrap STUN (DISABLED - Server expects NONE)
+            // guard let obfuscated = try await self.stunMasker.unwrap(data) else {
+            //    os_log("UDPProxy: Failed to unwrap STUN packet (%d bytes)", type: .debug, data.count)
+            //    return
+            // }
+            let obfuscated = data
+            
+            // 2. Decode (De-obfuscate)
+            let cleartext = try await self.codec.decode(obfuscated)
+            
+            // 3. Send to Local (WireGuard)
+            if let local = self.localConnection {
+                // logger.debug("Sending \(cleartext.count) bytes to local")
+                os_log("UDPProxy: <- Remote (%d bytes)", type: .debug, cleartext.count)
+                
+                local.send(content: cleartext, completion: .contentProcessed({ [weak self] error in
+                    if let error = error {
+                        Task { await self?.logError("Send local error: \(error.localizedDescription)") }
+                    }
+                }))
+            }
+            
+        } catch {
+            logger.error("De-obfuscation error: \(error.localizedDescription)")
+        }
+    }
+    
+    private func logError(_ message: String) {
+        logger.error("\(message)")
+        os_log("UDPProxy Error: %{public}@", type: .error, message)
     }
 }
 

@@ -12,11 +12,15 @@ let package = Package(
             targets: ["WGObfuscator"]
         )
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.6.1")
+    ],
     targets: [
         .target(
             name: "WGObfuscator",
-            dependencies: [],
+            dependencies: [
+                .product(name: "Logging", package: "swift-log")
+            ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]

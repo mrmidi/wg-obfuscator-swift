@@ -28,14 +28,25 @@ public struct ObfuscationEngine: Sendable {
         data.withUnsafeMutableBytes { buffer in
             guard let baseAddress = buffer.baseAddress else { return }
             
+            var crc: UInt8 = 0
+            
             for i in 0..<buffer.count {
-                // Get key byte (NO LENGTH DEPENDENCY - this fixes the C bug!)
+                // Get key byte
                 let keyByte = key[i % keyLength]
                 
-                // Calculate CRC8 based on key byte and key length only
-                // Original C bug: included data.count here causing encode/decode mismatch
-                let inbyte = keyByte &+ UInt8(keyLength)
-                let crc = CryptoUtilities.calculateCRC8(data: inbyte)
+                // Calculate CRC8 based on key byte, data length, and key length
+                // Reverting to match C implementation behavior (including length dependency)
+                var inbyte = keyByte &+ UInt8(truncatingIfNeeded: buffer.count) &+ UInt8(truncatingIfNeeded: keyLength)
+                
+                // Calculate CRC8 (Inlined to maintain state across iterations)
+                for _ in 0..<8 {
+                    let mix = (crc ^ inbyte) & 0x01
+                    crc >>= 1
+                    if mix != 0 {
+                        crc ^= 0x8C
+                    }
+                    inbyte >>= 1
+                }
                 
                 // XOR the data with the CRC
                 baseAddress.assumingMemoryBound(to: UInt8.self)[i] ^= crc
