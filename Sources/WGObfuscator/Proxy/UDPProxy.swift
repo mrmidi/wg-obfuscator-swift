@@ -229,9 +229,8 @@ public actor UDPProxy {
             
             let obfuscated = try await self.codec.encode(data, type: type)
             
-            // 2. Wrap in STUN (DISABLED - Server expects NONE)
-            // let wrapped = try await self.stunMasker.wrap(obfuscated)
-            let wrapped = obfuscated
+            // 2. Wrap in STUN
+            let wrapped = try await self.stunMasker.wrap(obfuscated)
             
             // 3. Send to Remote
             if let remote = self.remoteConnection {
@@ -273,12 +272,11 @@ public actor UDPProxy {
     
     private func processRemotePacket(_ data: Data) async {
         do {
-            // 1. Unwrap STUN (DISABLED - Server expects NONE)
-            // guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-            //    os_log("UDPProxy: Failed to unwrap STUN packet (%d bytes)", type: .debug, data.count)
-            //    return
-            // }
-            let obfuscated = data
+            // 1. Unwrap STUN
+             guard let obfuscated = try await self.stunMasker.unwrap(data) else {
+                os_log("UDPProxy: Failed to unwrap STUN packet (%d bytes)", type: .debug, data.count)
+                return
+             }
             
             // 2. Decode (De-obfuscate)
             let cleartext = try await self.codec.decode(obfuscated)
