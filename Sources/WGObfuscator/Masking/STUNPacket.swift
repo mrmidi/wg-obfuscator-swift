@@ -81,11 +81,12 @@ public struct STUNPacket: Sendable {
             throw STUNError.unknownMessageType(typeValue)
         }
         
-        // Parse message length
+        // Parse message length (Note: some servers may send 0 here but still include attributes)
         let messageLength = try CryptoUtilities.readUInt16BigEndian(from: data, at: 2)
-        guard data.count >= 20 + Int(messageLength) else {
-            throw STUNError.packetTooShort
-        }
+        
+        // Use actual packet size for validation, not the potentially incorrect messageLength
+        // Some implementations (like our C server) may set messageLength to 0 but still include attributes
+        let actualAttributesLength = data.count - 20
         
         // Verify magic cookie
         let cookie = try CryptoUtilities.readUInt32BigEndian(from: data, at: 4)
@@ -96,11 +97,12 @@ public struct STUNPacket: Sendable {
         // Extract transaction ID
         let transactionID = data.subdata(in: 8..<20)
         
-        // Parse attributes
+        // Parse attributes - use actual packet size, not the messageLength field
+        // This provides compatibility with servers that don't set messageLength correctly
         var attributes: [STUNAttribute] = []
         var offset = 20
         
-        while offset < data.count && offset < 20 + Int(messageLength) {
+        while offset + 4 <= data.count {  // Need at least 4 bytes for attr header
             let attrType = try CryptoUtilities.readUInt16BigEndian(from: data, at: offset)
             let attrLength = try CryptoUtilities.readUInt16BigEndian(from: data, at: offset + 2)
             
