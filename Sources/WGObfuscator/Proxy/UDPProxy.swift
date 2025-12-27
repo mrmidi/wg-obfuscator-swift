@@ -168,30 +168,42 @@ public actor UDPProxy {
         let connection = NWConnection(to: config.remoteEndpoint, using: params)
         self.remoteConnection = connection
         
+        os_log("UDPProxy: Starting remote connection to %{public}@", type: .info, String(describing: config.remoteEndpoint))
+        
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
-            Task { await self.handleRemoteConnectionState(state) }
+            Task { await self.handleRemoteConnectionState(state, connection: connection) }
         }
         
         connection.start(queue: .global())
         
-        // Start receiving loop
-        receiveFromRemote(connection)
+        // NOTE: Receive loop is now started in handleRemoteConnectionState when connection is .ready
     }
     
-    private func handleRemoteConnectionState(_ state: NWConnection.State) {
+    private func handleRemoteConnectionState(_ state: NWConnection.State, connection: NWConnection) {
+        os_log("UDPProxy: Remote connection state: %{public}@", type: .info, String(describing: state))
+        
         switch state {
         case .ready:
             logger.info("Connected to remote server")
+            os_log("UDPProxy: Remote connection READY - starting receive loop", type: .info)
+            // Start receiving ONLY when connection is ready
+            receiveFromRemote(connection)
         case .failed(let error):
             logger.error("Remote connection failed: \(error.localizedDescription)")
-            // Simple reconnect logic could go here
+            os_log("UDPProxy: Remote connection FAILED: %{public}@", type: .error, error.localizedDescription)
             remoteConnection = nil
-            // Try to reconnect after delay?
         case .cancelled:
+            os_log("UDPProxy: Remote connection CANCELLED", type: .info)
             remoteConnection = nil
-        default:
-            break
+        case .waiting(let error):
+            os_log("UDPProxy: Remote connection WAITING: %{public}@", type: .info, error.localizedDescription)
+        case .preparing:
+            os_log("UDPProxy: Remote connection PREPARING", type: .debug)
+        case .setup:
+            os_log("UDPProxy: Remote connection SETUP", type: .debug)
+        @unknown default:
+            os_log("UDPProxy: Remote connection UNKNOWN state", type: .debug)
         }
     }
     
