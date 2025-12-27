@@ -45,6 +45,11 @@ public actor UDPProxy {
         debugLogHandler?("[UDPProxy] \(message)")
     }
     
+    /// Set the debug log handler from outside the actor
+    public func setDebugLogHandler(_ handler: @escaping @Sendable (String) -> Void) {
+        self.debugLogHandler = handler
+    }
+    
     /// The port the proxy is actually listening on (valid after start)
     public var listeningPort: UInt16? {
         guard let endpoint = listener?.port else { return nil }
