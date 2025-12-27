@@ -271,19 +271,28 @@ public actor UDPProxy {
     }
     
     private func processRemotePacket(_ data: Data) async {
+        os_log("UDPProxy: Received packet from remote (%d bytes, first bytes: %{public}@)", type: .debug, data.count, data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " "))
+        
         do {
             // 1. Unwrap STUN
              guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-                os_log("UDPProxy: Failed to unwrap STUN packet (%d bytes)", type: .debug, data.count)
+                os_log("UDPProxy: STUN unwrap returned nil (%d bytes)", type: .debug, data.count)
+                // Check if it's a STUN packet at all
+                if STUNPacket.hasMagicCookie(data) {
+                    os_log("UDPProxy: Packet has STUN magic cookie but is not Data Indication", type: .debug)
+                } else {
+                    os_log("UDPProxy: Packet is not a STUN packet", type: .debug)
+                }
                 return
              }
+            
+            os_log("UDPProxy: STUN unwrapped successfully (%d bytes)", type: .debug, obfuscated.count)
             
             // 2. Decode (De-obfuscate)
             let cleartext = try await self.codec.decode(obfuscated)
             
             // 3. Send to Local (WireGuard)
             if let local = self.localConnection {
-                // logger.debug("Sending \(cleartext.count) bytes to local")
                 os_log("UDPProxy: <- Remote (%d bytes)", type: .debug, cleartext.count)
                 
                 local.send(content: cleartext, completion: .contentProcessed({ [weak self] error in
@@ -291,10 +300,13 @@ public actor UDPProxy {
                         Task { await self?.logError("Send local error: \(error.localizedDescription)") }
                     }
                 }))
+            } else {
+                os_log("UDPProxy: No local connection to send to!", type: .error)
             }
             
         } catch {
             logger.error("De-obfuscation error: \(error.localizedDescription)")
+            os_log("UDPProxy: De-obfuscation error: %{public}@", type: .error, error.localizedDescription)
         }
     }
     
