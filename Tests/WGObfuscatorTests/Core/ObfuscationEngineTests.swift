@@ -41,6 +41,21 @@ struct ObfuscationEngineTests {
         #expect(engine.key.count == 255, "Should accept 255-byte key")
     }
     
+    @Test("Engine preserves complex keys")
+    func testComplexKeyStorage() throws {
+        // Test that complex key with special characters is stored properly
+        let keyString = "Ipy:SMOQnfxK6>;Ks<?njL#0ta|W:To-e)Vb;+h?O&(|E!7nA73F&;x&uGi_X*Ja"
+        let key = Data(keyString.utf8)
+        let engine = try ObfuscationEngine(key: key)
+        
+        #expect(engine.key == key, "Key should be stored exactly as provided")
+        #expect(engine.key.count == 64, "Key length should be 64")
+        
+        // Verify specific bytes to ensure no encoding issues
+        #expect(engine.key[0] == UInt8(ascii: "I"), "First char should match")
+        #expect(engine.key[63] == UInt8(ascii: "a"), "Last char should match")
+    }
+    
     // MARK: - XOR Tests
     
     @Test("XOR is reversible")

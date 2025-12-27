@@ -120,12 +120,12 @@ public actor PacketCodec {
         switch type {
         case .handshakeInitiation, .handshakeResponse:
             let limit = min(maxDummy, maxDummyLengthHandshake)
-            return Int.random(in: 0...limit)
+            return Int.random(in: 0..<limit)
             
         case .cookie, .data:
             guard maxDummyLengthData > 0 else { return 0 }
             let limit = min(maxDummy, maxDummyLengthData)
-            return Int.random(in: 0...limit)
+            return Int.random(in: 0..<limit)
         }
     }
 }

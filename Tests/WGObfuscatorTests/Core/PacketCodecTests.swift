@@ -228,4 +228,77 @@ struct PacketCodecTests {
         #expect(decoded1 == original, "First decoding should work")
         #expect(decoded2 == original, "Second decoding should work")
     }
+    
+    // MARK: - Ported tests from C
+    
+    @Test("Dummy length encoding is correct (White-box test)")
+    func testDummyLengthEncoding() async throws {
+        // Test that dummy length is correctly stored in bytes 2-3 before final XOR
+        let key = Data("testkey".utf8)
+        let codec = try await PacketCodec(key: key, maxDummyLengthData: 10)
+        let engine = try ObfuscationEngine(key: key) // Local engine for manual de-obfuscation
+        
+        var original = Data(count: 148)
+        withUnsafeBytes(of: UInt32(1).littleEndian) { bytes in
+            original[0..<4] = Data(bytes.bindMemory(to: UInt8.self))
+        }
+        
+        let encoded = try await codec.encode(original, type: .handshakeInitiation)
+        
+        // Manually reverse the outer XOR layer to peek at internal structure
+        var bufferForInspection = encoded
+        engine.xor(&bufferForInspection)
+        
+        // Read the dummy length from bytes 2-3
+        let storedDummyLength = try CryptoUtilities.readUInt16LE(from: bufferForInspection, at: 2)
+        
+        // Calculate expected dummy length (Total - Original)
+        // Note: Encoded length = Original + Dummy
+        // So Dummy = Encoded - Original
+        let expectedDummyLength = encoded.count - original.count
+        
+        #expect(Int(storedDummyLength) == expectedDummyLength,
+               "Stored dummy length \(storedDummyLength) should match actual added bytes \(expectedDummyLength)")
+    }
+    
+    @Test("Mismatched keys statistically produce corruption")
+    func testMismatchedKeysStatistics() async throws {
+        let key1 = Data("Ipy:SMOQnfxK6>;Ks<?njL#0ta|W:To-e)Vb;+h?O&(|E!7nA73F&;x&uGi_X*Ja".utf8)
+        let key2 = Data("Ipy:SMOQnfxK6>;Ks<?njL#0ta|W:To-e)Vb;+h?O&(|E!7nA73F&;x&uGi_X*JA".utf8) // Last char differs
+        
+        let encoder = try await PacketCodec(key: key1)
+        let decoder = try await PacketCodec(key: key2)
+        
+        let originalLength = 307
+        var mismatchCount = 0
+        let iterations = 200
+        
+        for i in 0..<iterations {
+            var original = Data(count: originalLength)
+            withUnsafeBytes(of: UInt32(4).littleEndian) { bytes in
+                original[0..<4] = Data(bytes.bindMemory(to: UInt8.self))
+            }
+            // Add varying payload
+            for j in 16..<original.count {
+                original[j] = UInt8((j * 5 + i) & 0xFF)
+            }
+            
+            let encoded = try await encoder.encode(original, type: .data)
+            
+            // Attempt decode with wrong key
+            // It should either throw OR return corrupted data
+            do {
+                let decoded = try await decoder.decode(encoded)
+                if decoded != original {
+                    mismatchCount += 1
+                }
+            } catch {
+                mismatchCount += 1
+            }
+        }
+        
+        // We expect mismatches/failures in almost all cases
+        // Being generous with > 0, but realistically it should be near 100%
+        #expect(mismatchCount > 0, "Should detect corruption with mismatched keys")
+    }
 }
