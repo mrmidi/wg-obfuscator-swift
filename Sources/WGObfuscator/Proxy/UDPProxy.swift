@@ -29,12 +29,21 @@ public actor UDPProxy {
     private let config: Configuration
     private let logger = Logger(label: "com.wg-obfuscator.UDPProxy")
     
+    /// Optional debug log handler - call this to receive debug logs externally (e.g., to SharedLogger)
+    public var debugLogHandler: (@Sendable (String) -> Void)?
+    
     private var listener: NWListener?
     private var remoteConnection: NWConnection?
     private var localConnection: NWConnection?
     
     private let codec: PacketCodec
     private let stunMasker = STUNMasker()
+    
+    /// Helper to log debug messages both to os_log and external handler
+    private func debugLog(_ message: String) {
+        os_log("UDPProxy: %{public}@", type: .info, message)
+        debugLogHandler?("[UDPProxy] \(message)")
+    }
     
     /// The port the proxy is actually listening on (valid after start)
     public var listeningPort: UInt16? {
@@ -168,7 +177,7 @@ public actor UDPProxy {
         let connection = NWConnection(to: config.remoteEndpoint, using: params)
         self.remoteConnection = connection
         
-        os_log("UDPProxy: Starting remote connection to %{public}@", type: .info, String(describing: config.remoteEndpoint))
+        debugLog("Starting remote connection to \(String(describing: config.remoteEndpoint))")
         
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
@@ -181,29 +190,29 @@ public actor UDPProxy {
     }
     
     private func handleRemoteConnectionState(_ state: NWConnection.State, connection: NWConnection) {
-        os_log("UDPProxy: Remote connection state: %{public}@", type: .info, String(describing: state))
+        debugLog("Remote connection state: \(String(describing: state))")
         
         switch state {
         case .ready:
             logger.info("Connected to remote server")
-            os_log("UDPProxy: Remote connection READY - starting receive loop", type: .info)
+            debugLog("Remote connection READY - starting receive loop")
             // Start receiving ONLY when connection is ready
             receiveFromRemote(connection)
         case .failed(let error):
             logger.error("Remote connection failed: \(error.localizedDescription)")
-            os_log("UDPProxy: Remote connection FAILED: %{public}@", type: .error, error.localizedDescription)
+            debugLog("Remote connection FAILED: \(error.localizedDescription)")
             remoteConnection = nil
         case .cancelled:
-            os_log("UDPProxy: Remote connection CANCELLED", type: .info)
+            debugLog("Remote connection CANCELLED")
             remoteConnection = nil
         case .waiting(let error):
-            os_log("UDPProxy: Remote connection WAITING: %{public}@", type: .info, error.localizedDescription)
+            debugLog("Remote connection WAITING: \(error.localizedDescription)")
         case .preparing:
-            os_log("UDPProxy: Remote connection PREPARING", type: .debug)
+            debugLog("Remote connection PREPARING")
         case .setup:
-            os_log("UDPProxy: Remote connection SETUP", type: .debug)
+            debugLog("Remote connection SETUP")
         @unknown default:
-            os_log("UDPProxy: Remote connection UNKNOWN state", type: .debug)
+            debugLog("Remote connection UNKNOWN state")
         }
     }
     
@@ -283,29 +292,30 @@ public actor UDPProxy {
     }
     
     private func processRemotePacket(_ data: Data) async {
-        os_log("UDPProxy: Received packet from remote (%d bytes, first bytes: %{public}@)", type: .debug, data.count, data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " "))
+        let firstBytes = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+        debugLog("Received packet from remote (\(data.count) bytes, first bytes: \(firstBytes))")
         
         do {
             // 1. Unwrap STUN
              guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-                os_log("UDPProxy: STUN unwrap returned nil (%d bytes)", type: .debug, data.count)
+                debugLog("STUN unwrap returned nil (\(data.count) bytes)")
                 // Check if it's a STUN packet at all
                 if STUNPacket.hasMagicCookie(data) {
-                    os_log("UDPProxy: Packet has STUN magic cookie but is not Data Indication", type: .debug)
+                    debugLog("Packet has STUN magic cookie but is not Data Indication")
                 } else {
-                    os_log("UDPProxy: Packet is not a STUN packet", type: .debug)
+                    debugLog("Packet is not a STUN packet")
                 }
                 return
              }
             
-            os_log("UDPProxy: STUN unwrapped successfully (%d bytes)", type: .debug, obfuscated.count)
+            debugLog("STUN unwrapped successfully (\(obfuscated.count) bytes)")
             
             // 2. Decode (De-obfuscate)
             let cleartext = try await self.codec.decode(obfuscated)
             
             // 3. Send to Local (WireGuard)
             if let local = self.localConnection {
-                os_log("UDPProxy: <- Remote (%d bytes)", type: .debug, cleartext.count)
+                debugLog("<- Remote (\(cleartext.count) bytes) -> forwarding to local WireGuard")
                 
                 local.send(content: cleartext, completion: .contentProcessed({ [weak self] error in
                     if let error = error {
@@ -313,12 +323,12 @@ public actor UDPProxy {
                     }
                 }))
             } else {
-                os_log("UDPProxy: No local connection to send to!", type: .error)
+                debugLog("ERROR: No local connection to send to!")
             }
             
         } catch {
             logger.error("De-obfuscation error: \(error.localizedDescription)")
-            os_log("UDPProxy: De-obfuscation error: %{public}@", type: .error, error.localizedDescription)
+            debugLog("De-obfuscation error: \(error.localizedDescription)")
         }
     }
     
