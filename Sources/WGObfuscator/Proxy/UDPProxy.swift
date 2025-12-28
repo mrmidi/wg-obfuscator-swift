@@ -16,11 +16,14 @@ public actor UDPProxy {
         public let remoteEndpoint: NWEndpoint
         /// Obfuscation key
         public let key: Data
+        /// Masking type
+        public let masking: MaskingType
         
-        public init(localPort: UInt16 = 0, remoteEndpoint: NWEndpoint, key: Data) {
+        public init(localPort: UInt16 = 0, remoteEndpoint: NWEndpoint, key: Data, masking: MaskingType = .stun) {
             self.localPort = localPort
             self.remoteEndpoint = remoteEndpoint
             self.key = key
+            self.masking = masking
         }
     }
     
@@ -37,7 +40,7 @@ public actor UDPProxy {
     private var localConnection: NWConnection?
     
     private let codec: PacketCodec
-    private let stunMasker = STUNMasker()
+    private let masker: (any MaskingProvider)?
     
     /// Helper to log debug messages both to os_log and external handler
     private func debugLog(_ message: String) {
@@ -61,6 +64,7 @@ public actor UDPProxy {
     public init(configuration: Configuration) throws {
         self.config = configuration
         self.codec = try PacketCodec(key: configuration.key)
+        self.masker = MaskingFactory.create(configuration.masking)
     }
     
     // MARK: - Lifecycle
@@ -250,8 +254,13 @@ public actor UDPProxy {
             
             let obfuscated = try await self.codec.encode(data, type: type)
             
-            // 2. Wrap in STUN
-            let wrapped = try await self.stunMasker.wrap(obfuscated)
+            // 2. Wrap in Masking (if enabled)
+            let wrapped: Data
+            if let masker = self.masker {
+                wrapped = try await masker.wrap(obfuscated)
+            } else {
+                wrapped = obfuscated
+            }
             
             // 3. Send to Remote
             if let remote = self.remoteConnection {
@@ -293,11 +302,17 @@ public actor UDPProxy {
     
     private func processRemotePacket(_ data: Data) async {
         do {
-            // 1. Unwrap STUN
-             guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-                // Not a Data Indication - ignore (likely Binding Request/Response)
-                return
-             }
+            // 1. Unwrap Masking (if enabled)
+            let obfuscated: Data
+            if let masker = self.masker {
+                guard let content = try await masker.unwrap(data) else {
+                   // Not a Data Indication - ignore (likely Binding Request/Response)
+                   return
+                }
+                obfuscated = content
+            } else {
+                obfuscated = data
+            }
             
             // 2. Decode (De-obfuscate)
             let cleartext = try await self.codec.decode(obfuscated)
