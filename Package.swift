@@ -23,6 +23,10 @@ let package = Package(
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
+                // NOTE: For maximum performance, ensure the consuming Xcode project
+                // has "Swift Compiler - Code Generation" set to:
+                // - Optimization Level: Optimize for Speed [-O]
+                // - Compilation Mode: Whole Module (not Incremental)
             ]
         ),
         .testTarget(

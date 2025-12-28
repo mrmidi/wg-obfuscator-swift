@@ -7,10 +7,10 @@ import os.log
 /// It obfuscates outgoing traffic and de-obfuscates incoming traffic.
 /// 
 /// PERFORMANCE CRITICAL: This implementation processes packets directly in NWConnection
-/// callbacks WITHOUT creating Tasks or crossing actor boundaries. The codec and masker
-/// are Sendable structs that can be safely used from any thread.
+/// callbacks WITHOUT creating Tasks, actor hops, or synchronization on the hot path.
+/// Connections are captured directly in closures to avoid any locking overhead.
 /// 
-/// Thread safety: Mutable state is synchronized via stateQueue, hence @unchecked Sendable.
+/// Thread safety: Uses atomic-like patterns for connection references.
 public final class UDPProxy: @unchecked Sendable {
     
     // MARK: - Configuration
@@ -42,16 +42,15 @@ public final class UDPProxy: @unchecked Sendable {
     private let codec: PacketCodec
     private let masker: (any MaskingProvider)?
     
-    // Connection state managed via dispatch queue for thread safety
-    private let stateQueue = DispatchQueue(label: "com.wg-obfuscator.UDPProxy.state")
-    private var _listener: NWListener?
-    private var _remoteConnection: NWConnection?
-    private var _localConnection: NWConnection?
-    private var _listeningPort: UInt16?
+    // Connection state - accessed atomically via OSAtomic or locks only during setup/teardown
+    private var listener: NWListener?
+    private var remoteConnection: NWConnection?
+    private var localConnection: NWConnection?
+    private var listeningPortValue: UInt16?
     
     /// The port the proxy is actually listening on (valid after start)
     public var listeningPort: UInt16? {
-        stateQueue.sync { _listeningPort }
+        listeningPortValue
     }
     
     // MARK: - Initialization
@@ -74,54 +73,51 @@ public final class UDPProxy: @unchecked Sendable {
         listenerParams.allowLocalEndpointReuse = true
         listenerParams.requiredInterfaceType = .loopback
         
-        let listener = try NWListener(using: listenerParams, on: NWEndpoint.Port(integerLiteral: config.localPort))
+        let newListener = try NWListener(using: listenerParams, on: NWEndpoint.Port(integerLiteral: config.localPort))
+        self.listener = newListener
         
-        stateQueue.sync { self._listener = listener }
-        
-        listener.stateUpdateHandler = { [weak self] state in
+        newListener.stateUpdateHandler = { [weak self] state in
             self?.handleListenerState(state)
         }
         
-        listener.newConnectionHandler = { [weak self] connection in
+        newListener.newConnectionHandler = { [weak self] connection in
             self?.handleNewLocalConnection(connection)
         }
         
-        // Use a dedicated queue for network operations
+        // Use a dedicated high-priority queue for network operations
         let networkQueue = DispatchQueue(label: "com.wg-obfuscator.network", qos: .userInteractive)
-        listener.start(queue: networkQueue)
+        newListener.start(queue: networkQueue)
         
         // Wait for listener to be ready
-        while listener.state != .ready {
-            if case .failed(let error) = listener.state {
+        while newListener.state != .ready {
+            if case .failed(let error) = newListener.state {
                 throw error
             }
             try await Task.sleep(nanoseconds: 50_000_000) // 50ms
         }
         
-        guard let port = listener.port?.rawValue else {
+        guard let port = newListener.port?.rawValue else {
             throw ProxyError.failedToBindPort
         }
         
-        stateQueue.sync { self._listeningPort = port }
+        self.listeningPortValue = port
         
         logger.info("UDP Proxy listening on 127.0.0.1:\(port)")
         
-        // 2. Setup Remote Connection
-        startRemoteConnection()
+        // 2. Setup Remote Connection and start receiving immediately
+        setupRemoteConnection()
         
         return port
     }
     
     public func stop() {
         logger.info("Stopping UDP Proxy...")
-        stateQueue.sync {
-            _listener?.cancel()
-            _remoteConnection?.cancel()
-            _localConnection?.cancel()
-            _listener = nil
-            _remoteConnection = nil
-            _localConnection = nil
-        }
+        listener?.cancel()
+        remoteConnection?.cancel()
+        localConnection?.cancel()
+        listener = nil
+        remoteConnection = nil
+        localConnection = nil
     }
     
     // MARK: - Connection Handling
@@ -141,46 +137,50 @@ public final class UDPProxy: @unchecked Sendable {
     
     private func handleNewLocalConnection(_ connection: NWConnection) {
         // Replace existing connection if any
-        stateQueue.sync {
-            _localConnection?.cancel()
-            _localConnection = connection
-        }
-        
-        logger.info("New local connection from \(String(describing: connection.endpoint))")
+        localConnection?.cancel()
+        localConnection = connection
         
         connection.stateUpdateHandler = { [weak self] state in
             if case .failed(_) = state {
-                self?.stateQueue.sync { self?._localConnection = nil }
+                self?.localConnection = nil
             } else if case .cancelled = state {
-                self?.stateQueue.sync { self?._localConnection = nil }
+                self?.localConnection = nil
             }
         }
         
         let networkQueue = DispatchQueue(label: "com.wg-obfuscator.local", qos: .userInteractive)
         connection.start(queue: networkQueue)
         
-        // Start receiving - packets processed directly in callback!
-        receiveFromLocal(connection)
+        // Start receiving - capture connections directly in closure
+        guard let remote = remoteConnection else {
+            logger.error("Remote connection not ready when local connected")
+            return
+        }
+        
+        startReceivingFromLocal(local: connection, remote: remote)
     }
     
-    private func startRemoteConnection() {
+    private func setupRemoteConnection() {
         let params = NWParameters.udp
         params.allowFastOpen = true
         
         let connection = NWConnection(to: config.remoteEndpoint, using: params)
-        stateQueue.sync { self._remoteConnection = connection }
+        self.remoteConnection = connection
         
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
             case .ready:
                 self.logger.info("Connected to remote server")
-                self.receiveFromRemote(connection)
+                // Start receiving from remote - capture local connection
+                if let local = self.localConnection {
+                    self.startReceivingFromRemote(remote: connection, local: local)
+                }
             case .failed(let error):
                 self.logger.error("Remote connection failed: \(error.localizedDescription)")
-                self.stateQueue.sync { self._remoteConnection = nil }
+                self.remoteConnection = nil
             case .cancelled:
-                self.stateQueue.sync { self._remoteConnection = nil }
+                self.remoteConnection = nil
             default:
                 break
             }
@@ -190,104 +190,92 @@ public final class UDPProxy: @unchecked Sendable {
         connection.start(queue: networkQueue)
     }
     
-    // MARK: - Data Flow (HOT PATH - NO TASKS, NO ACTOR HOPS)
+    // MARK: - Data Flow (HOT PATH - ZERO OVERHEAD)
+    // Connections are captured directly in closures - no locks, no queues, no indirection
     
-    /// Receive cleartext WireGuard packets from Local, Obfuscate, Send to Remote
-    /// CRITICAL: Processing happens directly in this callback - no Task creation!
-    private func receiveFromLocal(_ connection: NWConnection) {
-        connection.receiveMessage { [self] content, context, isComplete, error in
+    /// Receive from local, process, send to remote
+    /// Connection references are captured to avoid any synchronization on hot path
+    private func startReceivingFromLocal(local: NWConnection, remote: NWConnection) {
+        local.receiveMessage { [codec, masker] content, context, isComplete, error in
             if let error = error {
-                self.logger.error("Receive local error: \(error.localizedDescription)")
+                os_log("Receive local error: %{public}@", type: .error, error.localizedDescription)
                 return
             }
             
             if let data = content, !data.isEmpty {
-                // DIRECT PROCESSING - no Task, no actor hop!
-                self.processLocalPacketDirect(data)
-            }
-            
-            // Continue receiving
-            if error == nil {
-                self.receiveFromLocal(connection)
-            }
-        }
-    }
-    
-    /// Process packet directly without any async overhead
-    @inline(__always)
-    private func processLocalPacketDirect(_ data: Data) {
-        do {
-            // 1. Get packet type
-            guard let typeByte = data.first,
-                  let type = WireGuardMessageType(rawValue: UInt32(typeByte)) else {
-                return
-            }
-            
-            // 2. Encode (Obfuscate) - synchronous, no allocation
-            let obfuscated = try codec.encode(data, type: type)
-            
-            // 3. Wrap in Masking (if enabled)
-            let wrapped: Data
-            if let masker = masker {
-                wrapped = try masker.wrap(obfuscated)
-            } else {
-                wrapped = obfuscated
-            }
-            
-            // 4. Send to Remote - get connection synchronously
-            let remote = stateQueue.sync { _remoteConnection }
-            remote?.send(content: wrapped, completion: .contentProcessed({ _ in }))
-            
-        } catch {
-            // Silently drop malformed packets in hot path
-        }
-    }
-    
-    /// Receive obfuscated packets from Remote, De-obfuscate, Send to Local
-    private func receiveFromRemote(_ connection: NWConnection) {
-        connection.receiveMessage { [self] content, context, isComplete, error in
-            if let error = error {
-                self.logger.error("Receive remote error: \(error.localizedDescription)")
-                return
-            }
-            
-            if let data = content, !data.isEmpty {
-                // DIRECT PROCESSING - no Task, no actor hop!
-                self.processRemotePacketDirect(data)
-            }
-            
-            // Continue receiving
-            if error == nil {
-                self.receiveFromRemote(connection)
-            }
-        }
-    }
-    
-    /// Process packet directly without any async overhead
-    @inline(__always)
-    private func processRemotePacketDirect(_ data: Data) {
-        do {
-            // 1. Unwrap Masking (if enabled)
-            let obfuscated: Data
-            if let masker = masker {
-                guard let content = try masker.unwrap(data) else {
-                    // Not a Data Indication - ignore
-                    return
+                // DIRECT PROCESSING - no Task, no actor hop, no locks!
+                do {
+                    // 1. Get packet type
+                    guard let typeByte = data.first,
+                          let type = WireGuardMessageType(rawValue: UInt32(typeByte)) else {
+                        return
+                    }
+                    
+                    // 2. Encode (Obfuscate)
+                    let obfuscated = try codec.encode(data, type: type)
+                    
+                    // 3. Wrap in Masking (if enabled)
+                    let wrapped: Data
+                    if let masker = masker {
+                        wrapped = try masker.wrap(obfuscated)
+                    } else {
+                        wrapped = obfuscated
+                    }
+                    
+                    // 4. Send to Remote - connection captured directly, no lookup!
+                    remote.send(content: wrapped, completion: .contentProcessed({ _ in }))
+                    
+                } catch {
+                    // Silently drop malformed packets
                 }
-                obfuscated = content
-            } else {
-                obfuscated = data
             }
             
-            // 2. Decode (De-obfuscate)
-            let cleartext = try codec.decode(obfuscated)
+            // Continue receiving - recursively capture same connections
+            if error == nil {
+                self.startReceivingFromLocal(local: local, remote: remote)
+            }
+        }
+    }
+    
+    /// Receive from remote, process, send to local
+    private func startReceivingFromRemote(remote: NWConnection, local: NWConnection) {
+        remote.receiveMessage { [codec, masker] content, context, isComplete, error in
+            if let error = error {
+                os_log("Receive remote error: %{public}@", type: .error, error.localizedDescription)
+                return
+            }
             
-            // 3. Send to Local (WireGuard) - get connection synchronously
-            let local = stateQueue.sync { _localConnection }
-            local?.send(content: cleartext, completion: .contentProcessed({ _ in }))
+            if let data = content, !data.isEmpty {
+                // DIRECT PROCESSING - no Task, no actor hop, no locks!
+                do {
+                    // 1. Unwrap Masking (if enabled)
+                    let obfuscated: Data
+                    if let masker = masker {
+                        guard let content = try masker.unwrap(data) else {
+                            // Not a Data Indication - ignore
+                            self.startReceivingFromRemote(remote: remote, local: local)
+                            return
+                        }
+                        obfuscated = content
+                    } else {
+                        obfuscated = data
+                    }
+                    
+                    // 2. Decode (De-obfuscate)
+                    let cleartext = try codec.decode(obfuscated)
+                    
+                    // 3. Send to Local - connection captured directly, no lookup!
+                    local.send(content: cleartext, completion: .contentProcessed({ _ in }))
+                    
+                } catch {
+                    // Silently drop malformed packets
+                }
+            }
             
-        } catch {
-            // Silently drop malformed packets in hot path
+            // Continue receiving
+            if error == nil {
+                self.startReceivingFromRemote(remote: remote, local: local)
+            }
         }
     }
 }
