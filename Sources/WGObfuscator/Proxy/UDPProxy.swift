@@ -5,6 +5,7 @@ import os.log
 
 /// UDP Proxy that sits between WireGuard (localhost) and the Remote Server.
 /// It obfuscates outgoing traffic and de-obfuscates incoming traffic.
+/// Performance optimized: uses synchronous codec/masker operations on hot path
 public actor UDPProxy {
     
     // MARK: - Configuration
@@ -243,28 +244,27 @@ public actor UDPProxy {
         }
     }
     
-    private func processLocalPacket(_ data: Data) async {
+    private func processLocalPacket(_ data: Data) {
         do {
-            // 1. Encode (Obfuscate)
+            // 1. Encode (Obfuscate) - SYNCHRONOUS now, no await
             guard let typeByte = data.first,
                   let type = WireGuardMessageType(rawValue: UInt32(typeByte)) else {
                 logger.error("Unknown WireGuard packet type: \(data.first ?? 0)")
                 return
             }
             
-            let obfuscated = try await self.codec.encode(data, type: type)
+            let obfuscated = try self.codec.encode(data, type: type)
             
-            // 2. Wrap in Masking (if enabled)
+            // 2. Wrap in Masking (if enabled) - SYNCHRONOUS now, no await
             let wrapped: Data
             if let masker = self.masker {
-                wrapped = try await masker.wrap(obfuscated)
+                wrapped = try masker.wrap(obfuscated)
             } else {
                 wrapped = obfuscated
             }
             
             // 3. Send to Remote
             if let remote = self.remoteConnection {
-                // logger.debug("Sending \(wrapped.count) bytes to remote (Type: \(type))")
                 os_log("UDPProxy: -> Remote (%d bytes, Type: %d)", type: .debug, wrapped.count, typeByte)
                 
                 remote.send(content: wrapped, completion: .contentProcessed({ [weak self] error in
@@ -300,12 +300,12 @@ public actor UDPProxy {
         }
     }
     
-    private func processRemotePacket(_ data: Data) async {
+    private func processRemotePacket(_ data: Data) {
         do {
-            // 1. Unwrap Masking (if enabled)
+            // 1. Unwrap Masking (if enabled) - SYNCHRONOUS now, no await
             let obfuscated: Data
             if let masker = self.masker {
-                guard let content = try await masker.unwrap(data) else {
+                guard let content = try masker.unwrap(data) else {
                    // Not a Data Indication - ignore (likely Binding Request/Response)
                    return
                 }
@@ -314,8 +314,8 @@ public actor UDPProxy {
                 obfuscated = data
             }
             
-            // 2. Decode (De-obfuscate)
-            let cleartext = try await self.codec.decode(obfuscated)
+            // 2. Decode (De-obfuscate) - SYNCHRONOUS now, no await
+            let cleartext = try self.codec.decode(obfuscated)
             
             // 3. Send to Local (WireGuard)
             if let local = self.localConnection {

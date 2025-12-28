@@ -1,8 +1,9 @@
 import Foundation
 
-/// Actor-based packet codec for encoding and decoding WireGuard packets
-/// Provides thread-safe encode/decode operations
-public actor PacketCodec {
+/// Thread-safe packet codec for encoding and decoding WireGuard packets
+/// Provides high-performance synchronous encode/decode operations
+/// Note: Converted from actor to struct for performance - no mutable state requires isolation
+public struct PacketCodec: Sendable {
     
     private let engine: ObfuscationEngine
     private let maxDummyLengthData: Int
@@ -23,7 +24,8 @@ public actor PacketCodec {
     ///   - type: WireGuard message type
     /// - Returns: Obfuscated packet data
     /// - Throws: ObfuscationError if encoding fails
-    public func encode(_ packet: Data, type: WireGuardMessageType) async throws -> Data {
+    @inline(__always)
+    public func encode(_ packet: Data, type: WireGuardMessageType) throws -> Data {
         guard packet.count >= 4 else {
             throw ObfuscationError.packetTooShort(expected: 4, got: packet.count)
         }
@@ -51,17 +53,17 @@ public actor PacketCodec {
         }
         
         // 5. Apply XOR obfuscation to entire packet
-        var mutableBuffer = buffer
-        engine.xor(&mutableBuffer)
+        engine.xor(&buffer)
         
-        return mutableBuffer
+        return buffer
     }
     
     /// Decode an obfuscated packet
     /// - Parameter packet: Obfuscated packet data
     /// - Returns: Original WireGuard packet data
     /// - Throws: ObfuscationError if decoding fails
-    public func decode(_ packet: Data) async throws -> Data {
+    @inline(__always)
+    public func decode(_ packet: Data) throws -> Data {
         guard packet.count >= 4 else {
             throw ObfuscationError.packetTooShort(expected: 4, got: packet.count)
         }
@@ -110,6 +112,7 @@ public actor PacketCodec {
     
     // MARK: - Private Helpers
     
+    @inline(__always)
     private func calculateDummyLength(for type: WireGuardMessageType, currentLength: Int) -> Int {
         guard currentLength < maxDummyLengthTotal else {
             return 0

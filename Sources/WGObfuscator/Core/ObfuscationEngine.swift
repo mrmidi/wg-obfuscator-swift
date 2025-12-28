@@ -1,7 +1,28 @@
 import Foundation
 
+/// Precomputed CRC8 lookup table using polynomial 0x8C
+/// This eliminates the need for 8 iterations per byte
+private let crc8LookupTable: [UInt8] = {
+    var table = [UInt8](repeating: 0, count: 256)
+    for i in 0..<256 {
+        var crc: UInt8 = 0
+        var byte = UInt8(i)
+        for _ in 0..<8 {
+            let mix = (crc ^ byte) & 0x01
+            crc >>= 1
+            if mix != 0 {
+                crc ^= 0x8C
+            }
+            byte >>= 1
+        }
+        table[i] = crc
+    }
+    return table
+}()
+
 /// Core obfuscation engine using XOR cipher with CRC8-based key derivation
 /// This matches the C implementation's algorithm but with critical bug fixes
+/// Performance optimized with CRC8 lookup table and unsafe pointer access
 public struct ObfuscationEngine: Sendable {
     
     public let key: Data
@@ -19,37 +40,38 @@ public struct ObfuscationEngine: Sendable {
         self.key = key
     }
     
-    /// Apply XOR obfuscation to data
-    /// Note: This is a FIXED version that removes the length-dependent bug from C implementation
+    /// Apply XOR obfuscation to data using optimized CRC8 lookup table
     /// - Parameter data: Data to obfuscate (will be modified in place)
+    @inline(__always)
     public func xor(_ data: inout Data) {
         let keyLength = key.count
+        let dataLength = data.count
         
-        data.withUnsafeMutableBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else { return }
-            
-            var crc: UInt8 = 0
-            
-            for i in 0..<buffer.count {
-                // Get key byte
-                let keyByte = key[i % keyLength]
-                
-                // Calculate CRC8 based on key byte, data length, and key length
-                // Reverting to match C implementation behavior (including length dependency)
-                var inbyte = keyByte &+ UInt8(truncatingIfNeeded: buffer.count) &+ UInt8(truncatingIfNeeded: keyLength)
-                
-                // Calculate CRC8 (Inlined to maintain state across iterations)
-                for _ in 0..<8 {
-                    let mix = (crc ^ inbyte) & 0x01
-                    crc >>= 1
-                    if mix != 0 {
-                        crc ^= 0x8C
-                    }
-                    inbyte >>= 1
+        // Use unsafe pointers for both key and data to eliminate subscript overhead
+        key.withUnsafeBytes { keyBuffer in
+            data.withUnsafeMutableBytes { dataBuffer in
+                guard let keyPtr = keyBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let dataPtr = dataBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return
                 }
                 
-                // XOR the data with the CRC
-                baseAddress.assumingMemoryBound(to: UInt8.self)[i] ^= crc
+                var crc: UInt8 = 0
+                let lengthComponent = UInt8(truncatingIfNeeded: dataLength) &+ UInt8(truncatingIfNeeded: keyLength)
+                
+                for i in 0..<dataLength {
+                    // Get key byte using direct pointer access (no bounds checking overhead)
+                    let keyByte = keyPtr[i % keyLength]
+                    
+                    // Calculate input byte for CRC
+                    let inbyte = keyByte &+ lengthComponent
+                    
+                    // CRC8 using lookup table - single array access instead of 8 iterations
+                    // The CRC state is accumulated, so we XOR with previous CRC
+                    crc = crc8LookupTable[Int(crc ^ inbyte)]
+                    
+                    // XOR the data with the CRC (direct pointer access)
+                    dataPtr[i] ^= crc
+                }
             }
         }
     }
