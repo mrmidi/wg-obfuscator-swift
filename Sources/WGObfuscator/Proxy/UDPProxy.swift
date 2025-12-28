@@ -182,7 +182,7 @@ public actor UDPProxy {
         let connection = NWConnection(to: config.remoteEndpoint, using: params)
         self.remoteConnection = connection
         
-        debugLog("Starting remote connection to \(String(describing: config.remoteEndpoint))")
+        // Connection setup logged only once on ready state
         
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
@@ -195,12 +195,10 @@ public actor UDPProxy {
     }
     
     private func handleRemoteConnectionState(_ state: NWConnection.State, connection: NWConnection) {
-        debugLog("Remote connection state: \(String(describing: state))")
-        
         switch state {
         case .ready:
             logger.info("Connected to remote server")
-            debugLog("Remote connection READY - starting receive loop")
+            debugLog("Remote connection READY")
             // Start receiving ONLY when connection is ready
             receiveFromRemote(connection)
         case .failed(let error):
@@ -208,16 +206,13 @@ public actor UDPProxy {
             debugLog("Remote connection FAILED: \(error.localizedDescription)")
             remoteConnection = nil
         case .cancelled:
-            debugLog("Remote connection CANCELLED")
             remoteConnection = nil
         case .waiting(let error):
             debugLog("Remote connection WAITING: \(error.localizedDescription)")
-        case .preparing:
-            debugLog("Remote connection PREPARING")
-        case .setup:
-            debugLog("Remote connection SETUP")
+        case .preparing, .setup:
+            break
         @unknown default:
-            debugLog("Remote connection UNKNOWN state")
+            break
         }
     }
     
@@ -297,38 +292,25 @@ public actor UDPProxy {
     }
     
     private func processRemotePacket(_ data: Data) async {
-        let firstBytes = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
-        debugLog("Received packet from remote (\(data.count) bytes, first bytes: \(firstBytes))")
-        
         do {
             // 1. Unwrap STUN
              guard let obfuscated = try await self.stunMasker.unwrap(data) else {
-                debugLog("STUN unwrap returned nil (\(data.count) bytes)")
-                // Check if it's a STUN packet at all
-                if STUNPacket.hasMagicCookie(data) {
-                    debugLog("Packet has STUN magic cookie but is not Data Indication")
-                } else {
-                    debugLog("Packet is not a STUN packet")
-                }
+                // Not a Data Indication - ignore (likely Binding Request/Response)
                 return
              }
-            
-            debugLog("STUN unwrapped successfully (\(obfuscated.count) bytes)")
             
             // 2. Decode (De-obfuscate)
             let cleartext = try await self.codec.decode(obfuscated)
             
             // 3. Send to Local (WireGuard)
             if let local = self.localConnection {
-                debugLog("<- Remote (\(cleartext.count) bytes) -> forwarding to local WireGuard")
-                
                 local.send(content: cleartext, completion: .contentProcessed({ [weak self] error in
                     if let error = error {
                         Task { await self?.logError("Send local error: \(error.localizedDescription)") }
                     }
                 }))
             } else {
-                debugLog("ERROR: No local connection to send to!")
+                debugLog("ERROR: No local connection!")
             }
             
         } catch {
